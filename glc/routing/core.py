@@ -20,7 +20,24 @@ LIMITS = {
     "groq": {"rpm": 30, "rpd": 1000, "tpm": 6000, "cooldown": 2, "max_ctx": 100000},
     "nvidia": {"rpm": 40, "rpd": 9999, "tpm": 100000, "cooldown": 2, "max_ctx": 100000},
     "gemini": {"rpm": 15, "rpd": 1000, "tpm": 250000, "cooldown": 4, "max_ctx": 1000000},
-    "openrouter": {"rpm": 20, "rpd": 50, "tpm": 99999999, "cooldown": 3, "max_ctx": 100000},
+    # PAID key. The old {rpm 20, rpd 50, cooldown 3} described a free OpenRouter
+    # account, and rpd 50 is a hard local gate: `can_use` refuses the provider
+    # outright at 50 calls in a day, whatever the account is actually entitled to.
+    # Fifty calls is one afternoon of testing, and because the counter is per
+    # PROVIDER rather than per model it took every openrouter-routed model down
+    # with it, paid ones included.
+    #
+    # A gateway cannot know an account's real entitlement — on OpenRouter it moves
+    # with the credit balance — so guessing low here fails closed on spend the user
+    # has already paid for. These bounds are deliberately loose: upstream is the
+    # authority, a real 429 is caught by `_backoff_seconds("rate_limited")` (30 s),
+    # and the caller's own ceilings (S17's max_calls_per_run) bound a runaway loop.
+    #
+    # NB `:free` model variants stay rate-limited by OpenRouter no matter how the
+    # account is funded, so a rung pinned to a `...:free` model can still 429.
+    # max_ctx is left at 100000 on purpose: it is a routing-correctness knob, not a
+    # rate limit, and OpenRouter serves models from 8k to 2M behind one name.
+    "openrouter": {"rpm": 500, "rpd": 200000, "tpm": 99999999, "cooldown": 0, "max_ctx": 100000},
     "github": {"rpm": 10, "rpd": 50, "tpm": 99999999, "cooldown": 6, "max_ctx": 8000},
 }
 
