@@ -19,7 +19,32 @@ LIMITS = {
     },
     "groq": {"rpm": 30, "rpd": 1000, "tpm": 6000, "cooldown": 2, "max_ctx": 100000},
     "nvidia": {"rpm": 40, "rpd": 9999, "tpm": 100000, "cooldown": 2, "max_ctx": 100000},
-    "gemini": {"rpm": 15, "rpd": 1000, "tpm": 250000, "cooldown": 4, "max_ctx": 1000000},
+    # PAID key. {rpm 15, rpd 1000, tpm 250000} are the AI Studio FREE-tier numbers
+    # for a flash model; a billed project is entitled to far more. Same reasoning
+    # as openrouter below — these are loose local bounds, not an entitlement model.
+    #
+    # `cooldown` was the expensive one here, and it is per KEY: at 4 s, with a
+    # two-key pool, five calls in as many seconds exhausted both and the gateway
+    # answered "all providers unavailable" while neither key was near a real quota
+    # (rpd_used was 6 of 1000 at the time). It reads as an outage.
+    #
+    # Setting it to 0 was only safe once `rotate_pools` existed. The cooldown was
+    # doing a second, undocumented job: `pick()` takes the first AVAILABLE
+    # candidate, so the only thing spreading calls across GEMINI_API_KEY_1..N was
+    # the previous key being briefly unavailable. That left no good value — high
+    # enough to rotate and concurrent callers get "all providers unavailable"
+    # (measured: 4 of 6 parallel requests failed at 0.25 s), low enough not to
+    # throttle and gemini_2 never serves anything. Rotation now lives in
+    # rotate_pools() where it costs nothing, so this can be 0.
+    #
+    # NB this does NOT address the other Gemini failure seen on 2026-08-15: HTTP
+    # 503 "this model is currently experiencing high demand" on gemini-3.7-flash is
+    # an upstream capacity signal, not a local gate, and no value here can fix it.
+    # That is why S17's frontier rung reaches that model through OpenRouter.
+    # Related, and deliberately left alone: routing.yaml's `backoff.timeout: 600`
+    # benches a key for ten minutes after one slow call, which is what took the
+    # whole pool down when 3.7-flash answered in 34 s and 43 s.
+    "gemini": {"rpm": 2000, "rpd": 200000, "tpm": 4000000, "cooldown": 0, "max_ctx": 1000000},
     # PAID key. The old {rpm 20, rpd 50, cooldown 3} described a free OpenRouter
     # account, and rpd 50 is a hard local gate: `can_use` refuses the provider
     # outright at 50 calls in a day, whatever the account is actually entitled to.
@@ -157,6 +182,40 @@ class RateState:
         }
 
 
+def _pool_base(name: str) -> str:
+    """``gemini_2`` -> ``gemini``; anything else is its own pool of one."""
+    base, sep, tail = name.rpartition("_")
+    return base if sep and tail.isdigit() else name
+
+
+def rotate_pools(candidates: list[str], state) -> list[str]:
+    """Order the members of one key pool least-recently-used first.
+
+    ``pick`` takes the first AVAILABLE candidate, so a pool like
+    ``gemini_1, gemini_2`` serves everything from the first member unless
+    something makes that member unavailable. That something used to be the
+    per-key ``cooldown``, which left load spreading riding on a rate-limit knob
+    and no good value to set: high enough to rotate and concurrent callers get
+    "all providers unavailable"; low enough not to throttle and the rest of the
+    pool is never touched at all.
+
+    Rotation belongs here instead, where it costs nothing. Only members of the
+    SAME pool are reordered, and a pool keeps the slot its first member held, so
+    the preference order BETWEEN providers — which is the whole meaning of the
+    rings in routing.yaml — is left exactly as the caller supplied it.
+    """
+    grouped: dict[str, list[str]] = {}
+    for name in candidates:
+        grouped.setdefault(_pool_base(name), []).append(name)
+    out: list[str] = []
+    for base in dict.fromkeys(_pool_base(name) for name in candidates):
+        members = grouped[base]
+        if len(members) > 1:
+            members = sorted(members, key=lambda name: state[name].last_call)
+        out.extend(members)
+    return out
+
+
 class Router:
     def __init__(self, providers: dict, order: list[str]):
         self.providers = providers
@@ -189,7 +248,7 @@ class Router:
 
     def pick(self, est_tokens, candidates, required_caps: list[str] | None = None):
         attempts = []
-        for name in candidates:
+        for name in rotate_pools(candidates, self.state):
             limits = LIMITS[name]
             prov = self.providers[name]
             caps = getattr(prov, "capabilities", {})
@@ -247,7 +306,7 @@ class RouterPool:
         """Pick first available router provider. Caps require nothing — router
         LLMs only need to emit one word, no tools/reasoning/structured needed."""
         attempts = []
-        for name in self.candidates():
+        for name in rotate_pools(self.candidates(), self.state):
             limits = LIMITS[name]
             ok, why = self.state[name].can_use(limits, est_tokens)
             if ok:
